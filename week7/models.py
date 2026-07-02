@@ -12,20 +12,37 @@ import torch
 import torch.nn as nn
 
 
+def _normalize_kernel_size(kernel_size: int | tuple[int, int]) -> tuple[tuple[int, int], tuple[int, int]]:
+    """
+    将卷积核统一为二维形式，并计算对应的 same padding。
+
+    约定：
+    - int: 视为方形卷积核 k x k；
+    - tuple[int, int]: 视为 (kernel_height, kernel_width)。
+    """
+    if isinstance(kernel_size, int):
+        kernel_hw = (kernel_size, kernel_size)
+    else:
+        if len(kernel_size) != 2:
+            raise ValueError(f"kernel_size must be int or tuple[int, int], got {kernel_size}")
+        kernel_hw = (int(kernel_size[0]), int(kernel_size[1]))
+
+    padding_hw = (kernel_hw[0] // 2, kernel_hw[1] // 2)
+    return kernel_hw, padding_hw
+
+
 class ConvBlock(nn.Module):
     """基础卷积特征提取块。"""
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int | tuple[int, int]):
         super().__init__()
-        padding = kernel_size // 2
+        kernel_hw, padding_hw = _normalize_kernel_size(kernel_size)
         self.block = nn.Sequential(
-            # 第一个卷积层：提取局部模式。
-            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding),
+            # 当 kernel_size 为 tuple 时，使用矩形卷积核。
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_hw, padding=padding_hw),
             nn.ReLU(),
-            # 第二个卷积层：进一步组合局部特征。
-            nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=padding),
+            nn.Conv2d(out_channels, out_channels, kernel_size=kernel_hw, padding=padding_hw),
             nn.ReLU(),
-            # 自适应池化：将不同位置的响应汇总到固定长度特征向量。
             nn.AdaptiveAvgPool2d((1, 1)),
         )
 
@@ -45,9 +62,21 @@ class CNNRegressor(nn.Module):
         y_hat: [Batch, output_dim]
     """
 
-    def __init__(self, in_channels: int = 1, hidden_channels: int = 16, kernel_size: int = 3, output_dim: int = 1):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        hidden_channels: int = 16,
+        kernel_size: int = 3,
+        output_dim: int = 1,
+        kernel_width: int = 5,
+    ):
         super().__init__()
-        self.encoder = ConvBlock(in_channels, hidden_channels, kernel_size=kernel_size)
+        # 与论文 Multi-sight 设定保持一致：宽度固定为 5，长度沿时间方向变化。
+        self.encoder = ConvBlock(
+            in_channels,
+            hidden_channels,
+            kernel_size=(kernel_size, kernel_width),
+        )
         self.head = nn.Linear(hidden_channels, output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -59,9 +88,10 @@ class MultiSightCNN(nn.Module):
     """
     Multi-sight 多分支 CNN。
 
-    每个分支使用不同卷积核大小，模拟论文中“多视角观察”：
-    小卷积核更关注高频、局部波动；
-    大卷积核更关注低频、平滑趋势与更大感受野。
+    每个分支使用不同长度的矩形卷积核，宽度固定为 5：
+    - (3, 5)
+    - (5, 5)
+    - (7, 5)
     """
 
     def __init__(
@@ -71,13 +101,14 @@ class MultiSightCNN(nn.Module):
         kernel_sizes: tuple[int, ...] = (3, 5, 7),
         output_dim: int = 1,
         dropout: float = 0.1,
+        kernel_width: int = 5,
     ):
         super().__init__()
         self.kernel_sizes = kernel_sizes
-        # 不同分支对应不同感受野。
+        self.kernel_width = kernel_width
         self.branches = nn.ModuleList(
             [
-                ConvBlock(in_channels, hidden_channels, kernel_size=k)
+                ConvBlock(in_channels, hidden_channels, kernel_size=(k, kernel_width))
                 for k in kernel_sizes
             ]
         )
@@ -91,6 +122,5 @@ class MultiSightCNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 输入形状: [Batch, 1, H, W]
         multi_scale_features = [branch(x) for branch in self.branches]
-        # 拼接多个尺度的特征，再做融合回归。
         fused = torch.cat(multi_scale_features, dim=1)
         return self.fusion(fused)
